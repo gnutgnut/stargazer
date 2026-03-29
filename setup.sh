@@ -152,9 +152,9 @@ info "Building stargazer (release)..."
 cd "${SCRIPT_DIR}"
 export PATH="${HOME}/.local/bin:${PATH}"
 if [[ -x "${SCRIPT_DIR}/zigcc.sh" ]]; then
-    CC="${SCRIPT_DIR}/zigcc.sh" cargo build --release 2>&1
+    CC="${SCRIPT_DIR}/zigcc.sh" cargo build --release --bin stargazer 2>&1
 else
-    cargo build --release 2>&1
+    cargo build --release --bin stargazer 2>&1
 fi
 
 info "Done! Run with:"

@@ -26,7 +26,7 @@ exit /b 1
 :checkbuild
 echo [+] Building stargazer (release)...
 echo.
-cargo build --release --target-dir target-win
+cargo build --release --target-dir target-win --bin stargazer
 if %errorlevel% neq 0 goto :buildfail
 echo.
 echo [+] Done! Run with:
