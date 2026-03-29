@@ -1,6 +1,8 @@
 use minifb::{Key, Window, WindowOptions};
 use std::time::{Duration, Instant};
 use std::thread;
+use std::io::Write;
+use std::fs::File;
 
 // ── Config ──────────────────────────────────────────────────────────────────
 const LAYER_COUNT: usize = 5;
@@ -22,11 +24,12 @@ const WIDTH: usize = 1280;
 const HEIGHT: usize = 720;
 
 // Adaptive star count: frame budget threshold for scaling
-const BUDGET_MS: f32 = 14.0;  // if work takes >14ms, start shedding stars
-const GROW_MS: f32 = 10.0;    // if work takes <10ms, add more stars back
-const STAR_STEP: usize = 500; // add/remove this many per adjustment
+const BUDGET_MS: f32 = 15.0;  // if avg frame >15ms, shed stars
+const GROW_MS: f32 = 12.0;    // if avg frame <12ms, grow back
+const SHED_STEP: usize = 2000; // shed aggressively to recover fast
+const GROW_STEP: usize = 500;  // grow back gently to avoid oscillation
 const MIN_STARS: usize = 2000;
-const ADJUST_INTERVAL: u32 = 30; // check every N frames (0.5s at 60fps)
+const ADJUST_INTERVAL: u32 = 15; // check every 15 frames (~0.25s)
 
 // ── Layer definitions ───────────────────────────────────────────────────────
 struct LayerDef {
@@ -291,12 +294,15 @@ impl Starfield {
     }
 
     /// Adaptive star count: shed stars if over budget, grow if under.
-    fn adjust_count(&mut self, work_ms: f32) {
-        if work_ms > BUDGET_MS && self.active > MIN_STARS {
-            self.active = self.active.saturating_sub(STAR_STEP).max(MIN_STARS);
+    fn adjust_count(&mut self, avg_frame_ms: f32) {
+        if avg_frame_ms > BUDGET_MS && self.active > MIN_STARS {
+            // Shed aggressively — proportional to how far over budget
+            let overshoot = ((avg_frame_ms - BUDGET_MS) / BUDGET_MS * SHED_STEP as f32) as usize;
+            let step = overshoot.max(SHED_STEP);
+            self.active = self.active.saturating_sub(step).max(MIN_STARS);
             self.recompute_active_groups();
-        } else if work_ms < GROW_MS && self.active < self.count {
-            self.active = (self.active + STAR_STEP).min(self.count);
+        } else if avg_frame_ms < GROW_MS && self.active < self.count {
+            self.active = (self.active + GROW_STEP).min(self.count);
             self.recompute_active_groups();
         }
     }
@@ -543,19 +549,70 @@ fn draw_num(pixels: &mut [u32], w: usize, x: usize, y: usize, val: u32, color: u
     len * 4 * scale
 }
 
-/// Draw HUD: "FPS | STARS | DROPS"
-fn draw_hud(pixels: &mut [u32], w: usize, fps: u32, stars: u32, drops: u32) {
-    let y = 10;
-    let scale = 2;
-    let gap = 3 * scale; // gap between numbers
-    let mut x = 10;
-    // FPS in green
-    x += draw_num(pixels, w, x, y, fps, 0xFF44FF44, scale) + gap;
-    // Star count in dim cyan
-    x += draw_num(pixels, w, x, y, stars, 0xFF44AAAA, scale) + gap;
-    // Drop count in red (or dim if zero)
-    let drop_color = if drops > 0 { 0xFFFF4444 } else { 0xFF444444 };
-    draw_num(pixels, w, x, y, drops, drop_color, scale);
+/// Clear a rectangle in the pixel buffer to black.
+fn clear_rect(pixels: &mut [u32], w: usize, x: usize, y: usize, rw: usize, rh: usize) {
+    for row in y..y + rh {
+        if row >= pixels.len() / w { break; }
+        let start = row * w + x;
+        let end = (start + rw).min(pixels.len());
+        for idx in start..end {
+            pixels[idx] = 0;
+        }
+    }
+}
+
+const HUD_ENTRIES: usize = 3;
+
+struct Hud {
+    prev_vals: [u32; HUD_ENTRIES],
+    fade: [u8; HUD_ENTRIES],  // 255 = full bright, decays toward floor
+    base_colors: [u32; HUD_ENTRIES],
+}
+
+impl Hud {
+    fn new() -> Self {
+        Self {
+            prev_vals: [u32::MAX; HUD_ENTRIES],
+            fade: [255; HUD_ENTRIES],
+            base_colors: [
+                0xFF44FF44, // FPS: green
+                0xFF44AAAA, // stars: cyan
+                0xFFFF4444, // drops: red
+            ],
+        }
+    }
+
+    fn draw(&mut self, pixels: &mut [u32], w: usize, vals: [u32; HUD_ENTRIES]) {
+        let y: usize = 12;
+        let scale: usize = 3;
+        let gap: usize = 8 * scale;
+        // Max possible HUD width: 3 numbers × 6 digits × 4px × scale + gaps
+        let hud_h = 5 * scale + 4;
+        let hud_w = 3 * 6 * 4 * scale + 2 * gap + 8;
+
+        // Clear entire HUD background so old digits don't ghost
+        clear_rect(pixels, w, 8, if y > 1 { y - 1 } else { 0 }, hud_w, hud_h);
+
+        let mut x = 10;
+        for entry in 0..HUD_ENTRIES {
+            let val = vals[entry];
+
+            // Changed? flash bright
+            if val != self.prev_vals[entry] {
+                self.fade[entry] = 255;
+                self.prev_vals[entry] = val;
+            } else {
+                // Decay toward dim floor (40 for active elements, 20 for zero drops)
+                let floor: u8 = if entry == 2 && val == 0 { 15 } else { 50 };
+                if self.fade[entry] > floor {
+                    self.fade[entry] = self.fade[entry].saturating_sub(4);
+                }
+            }
+
+            let color = dim_color(self.base_colors[entry], self.fade[entry] as u32);
+            x += draw_num(pixels, w, x, y, val, color, scale) + gap;
+        }
+    }
 }
 
 // ── Main ────────────────────────────────────────────────────────────────────
@@ -578,6 +635,7 @@ fn main() {
 
     let mut pixels = vec![0u32; WIDTH * HEIGHT];
     let mut sf = Starfield::new(WIDTH, HEIGHT);
+    let mut hud = Hud::new();
 
     let mut fps: u32 = 0;
     let mut frame_count: u32 = 0;
@@ -588,6 +646,10 @@ fn main() {
     let mut frame_start = Instant::now();
     let mut adjust_counter: u32 = 0;
     let mut work_ms_accum: f32 = 0.0;
+    let mut frame_num: u64 = 0;
+    let mut log = File::create("stargazer.log").expect("Failed to create log file");
+    writeln!(log, "frame,time_ms,dt_ms,active,fps,drops,adjusted").unwrap();
+    let app_start = Instant::now();
 
     eprintln!(
         "Stargazer: {}x{}, {} stars (groups: 1px={}, 2x2={}, 3x3={}, landmark={})",
@@ -612,14 +674,21 @@ fn main() {
         // Render stars into pixel buffer
         sf.render(&mut pixels);
 
-        // Measure work time (before present, which includes the
-        // buffer copy and any OS-level vsync wait)
-        let work_ms = frame_start.elapsed().as_secs_f32() * 1000.0;
-        work_ms_accum += work_ms;
+        // HUD: FPS (green) | star count (cyan) | drops/sec (red)
+        // Fades when stable, flashes bright on change, clears background
+        hud.draw(&mut pixels, WIDTH, [fps, sf.active as u32, drop_count]);
 
-        // FPS & drop counter
+        window.update_with_buffer(&pixels, WIDTH, HEIGHT)
+            .expect("Failed to update window");
+
+        // Measure TOTAL frame time including the buffer copy above.
+        // This is the real cost — if this exceeds 16.67ms we drop frames.
+        let total_frame_ms = frame_start.elapsed().as_secs_f32() * 1000.0;
+        work_ms_accum += total_frame_ms;
+
+        // FPS & drop counter (use raw_dt which is previous frame's total time)
         frame_count += 1;
-        if raw_dt > FRAME_DT * 1.5 {
+        if raw_dt > FRAME_DT * 1.3 {
             total_drops += 1;
         }
         let elapsed = fps_timer.elapsed();
@@ -633,18 +702,32 @@ fn main() {
 
         // Adaptive star count: check every ADJUST_INTERVAL frames
         adjust_counter += 1;
+        let mut adjusted = false;
         if adjust_counter >= ADJUST_INTERVAL {
-            let avg_work = work_ms_accum / adjust_counter as f32;
-            sf.adjust_count(avg_work);
+            let avg_frame = work_ms_accum / adjust_counter as f32;
+            let before = sf.active;
+            sf.adjust_count(avg_frame);
+            adjusted = sf.active != before;
             work_ms_accum = 0.0;
             adjust_counter = 0;
         }
 
-        // HUD: FPS (green) | star count (cyan) | drops/sec (red)
-        draw_hud(&mut pixels, WIDTH, fps, sf.active as u32, drop_count);
-
-        window.update_with_buffer(&pixels, WIDTH, HEIGHT)
-            .expect("Failed to update window");
+        // Log every frame, capped at 60000 lines (~16 min at 60fps, ~5MB max)
+        frame_num += 1;
+        if frame_num <= 60000 {
+            let _ = writeln!(log, "{},{:.2},{:.2},{},{},{},{}",
+                frame_num,
+                app_start.elapsed().as_secs_f32() * 1000.0,
+                raw_dt * 1000.0,
+                sf.active,
+                fps,
+                total_drops,
+                if adjusted { 1 } else { 0 },
+            );
+            if frame_num == 60000 {
+                let _ = writeln!(log, "# log capped at 60000 frames");
+            }
+        }
 
         // Precise frame cap
         let work_time = frame_start.elapsed();
