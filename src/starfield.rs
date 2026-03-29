@@ -108,9 +108,9 @@ const BANNER_FONT: &[(u8, [u8; 9])] = &[
 
 const BANNER_CHAR_W: usize = 7;
 const BANNER_CHAR_H: usize = 9;
-const BANNER_SCALE: usize = 10;
-const _BANNER_SPACING: usize = 3; // gap in font pixels between chars
-const BANNER_DENSITY: usize = 3; // stars per "on" pixel
+const BANNER_SCALE: usize = 14;    // big and bold
+const _BANNER_SPACING: usize = 3;
+const BANNER_DENSITY: usize = 5;   // thick star clusters per font pixel
 const BANNER_FRAMES_PER_CHAR: u32 = 20; // ~0.33s between letters at 60fps
 
 struct BannerQueue {
@@ -149,11 +149,20 @@ fn precompute_landmark() -> LandmarkColors {
 }
 
 // ── SoA Starfield ───────────────────────────────────────────────────────────
+// Z-drift: very gradual forward motion into the starfield.
+// Each star's depth drifts from 1.0 (far) toward 0.0 (near) over time,
+// making it brighter and slightly faster. Resets to far when wrapping.
+const Z_DRIFT_RATE: f32 = 0.0003; // depth units per frame (~18s far→near at 60fps)
+const Z_BRIGHT_BOOST: f32 = 0.6;  // max brightness multiplier at z=0 (60% brighter)
+const Z_SPEED_BOOST: f32 = 0.3;   // max speed multiplier at z=0 (30% faster)
+
 pub struct Starfield {
     x: Vec<i32>,
     y: Vec<i32>,
     speed_x: Vec<i32>,
     speed_y: Vec<i32>,
+    base_speed_x: Vec<i32>,  // original speed before z-boost
+    z: Vec<f32>,             // depth: 1.0 = far, 0.0 = near
     color: Vec<u32>,
     base_color: Vec<u32>,
     color_edge: Vec<u32>,
@@ -184,6 +193,8 @@ impl Starfield {
             y: vec![0i32; STAR_CEILING],
             speed_x: vec![0i32; STAR_CEILING],
             speed_y: vec![0i32; STAR_CEILING],
+            base_speed_x: vec![0i32; STAR_CEILING],
+            z: vec![1.0f32; STAR_CEILING],
             color: vec![0u32; STAR_CEILING],
             base_color: vec![0u32; STAR_CEILING],
             color_edge: vec![0u32; STAR_CEILING],
@@ -217,7 +228,13 @@ impl Starfield {
 
                 let vary_range = (spd_x / 4).unsigned_abs().max(1);
                 let vary = sf.rng.range(vary_range) as i32;
-                sf.speed_x[idx] = -((spd_x - spd_x / 8 + vary).max(1));
+                let base_spd = -((spd_x - spd_x / 8 + vary).max(1));
+                sf.speed_x[idx] = base_spd;
+                sf.base_speed_x[idx] = base_spd;
+                // Depth: far layers start near 1.0, near layers near 0.3
+                // Randomize a bit so stars don't all arrive at the same time
+                sf.z[idx] = 0.3 + 0.7 * (l as f32 / (LAYER_COUNT - 1) as f32)
+                    + (sf.rng.range(100) as f32 - 50.0) * 0.002;
 
                 if spd_y > 0 {
                     let vy = sf.rng.range((spd_y as u32).wrapping_mul(2).max(1)) as i32;
@@ -318,8 +335,11 @@ impl Starfield {
                     self.y[idx] = (py as i32) << FP_SHIFT;
 
                     let vary = self.rng.range(2000) as i32 - 1000;
-                    self.speed_x[idx] = banner_speed + vary;
+                    let spd = banner_speed + vary;
+                    self.speed_x[idx] = spd;
+                    self.base_speed_x[idx] = spd;
                     self.speed_y[idx] = 0;
+                    self.z[idx] = 0.2; // banner stars are "near"
 
                     let base = if self.rng.range(3) == 0 { banner_color_dim } else { banner_color_bright };
                     let bright = 200 + self.rng.range(56) as u8;
@@ -363,8 +383,11 @@ impl Starfield {
                 self.x[i] = (self.rng.range(w as u32) as i32) << FP_SHIFT;
                 self.y[i] = (self.rng.range(h as u32) as i32) << FP_SHIFT;
                 let spd_x = fp_from_float(ld.speed_x);
-                self.speed_x[i] = -(spd_x.max(1));
+                let base_spd = -(spd_x.max(1));
+                self.speed_x[i] = base_spd;
+                self.base_speed_x[i] = base_spd;
                 self.speed_y[i] = 0;
+                self.z[i] = 0.7 + self.rng.range(30) as f32 * 0.01; // start far
                 let bright = ld.bright_lo + self.rng.range((ld.bright_hi - ld.bright_lo + 1) as u32) as u8;
                 self.base_bright[i] = bright;
                 let c = dim_color(ld.color, bright as u32);
@@ -391,6 +414,8 @@ impl Starfield {
         apply_perm!(self.y);
         apply_perm!(self.speed_x);
         apply_perm!(self.speed_y);
+        apply_perm!(self.base_speed_x);
+        apply_perm!(self.z);
         apply_perm!(self.color);
         apply_perm!(self.base_color);
         apply_perm!(self.color_edge);
@@ -484,7 +509,10 @@ impl Starfield {
             let spd_x = fp_from_float(ld.speed_x);
             let vary_range = (spd_x / 4).unsigned_abs().max(1);
             let vary = self.rng.range(vary_range) as i32;
-            self.speed_x[idx] = -((spd_x - spd_x / 8 + vary).max(1));
+            let base_spd = -((spd_x - spd_x / 8 + vary).max(1));
+            self.speed_x[idx] = base_spd;
+            self.base_speed_x[idx] = base_spd;
+            self.z[idx] = 0.5 + self.rng.range(50) as f32 * 0.01;
 
             let spd_y = fp_from_float(ld.drift_y);
             if spd_y > 0 {
@@ -552,7 +580,32 @@ impl Starfield {
             y[i] = v;
         }
 
+        // Z-drift: stars slowly approach (z decreases).
+        // Apply brightness and speed boost based on depth.
+        // Only process every 4th frame to save cost — drift is very gradual.
         self.frame += 1;
+        if self.frame % 4 == 0 {
+            for i in 0..count {
+                self.z[i] -= Z_DRIFT_RATE * 4.0; // compensate for 4-frame skip
+                if self.z[i] < 0.0 {
+                    // Wrap back to far — this star "passed us"
+                    self.z[i] = 0.9 + (self.rng.next() & 0xFF) as f32 * 0.0004; // 0.9-1.0
+                }
+                // Speed boost: nearer = faster
+                let nearness = 1.0 - self.z[i]; // 0=far, 1=near
+                let speed_mult = 1.0 + nearness * Z_SPEED_BOOST;
+                self.speed_x[i] = (self.base_speed_x[i] as f32 * speed_mult) as i32;
+
+                // Brightness boost
+                let bright_mult = 1.0 + nearness * Z_BRIGHT_BOOST;
+                let boosted = (self.base_bright[i] as f32 * bright_mult).min(255.0) as u32;
+                self.color[i] = dim_color(self.base_color[i], boosted);
+                if self.size[i] >= 2 {
+                    self.color_edge[i] = dim_color(self.color[i], 200);
+                    self.color_corner[i] = dim_color(self.color[i], 120);
+                }
+            }
+        }
         if self.frame % TWINKLE_PERIOD == 0 {
             for i in (0..count).step_by(7) {
                 let r = self.rng.next();
