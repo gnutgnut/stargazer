@@ -1,15 +1,15 @@
-#!/bin/sh
+#!/bin/bash
 ZIG="${HOME}/.local/bin/zig"
-args=""
+args=()
 for arg in "$@"; do
     case "$arg" in
         --target=*-unknown-linux-gnu)
             triple="$(echo "$arg" | sed 's/--target=//;s/-unknown-linux-gnu/-linux-gnu/')"
-            args="$args --target=$triple"
+            args+=("--target=$triple")
             ;;
         *)
-            args="$args $arg"
+            args+=("$arg")
             ;;
     esac
 done
-exec "$ZIG" cc $args
+exec "$ZIG" cc "${args[@]}"

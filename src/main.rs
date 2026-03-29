@@ -1,14 +1,23 @@
 use minifb::{Key, Window, WindowOptions};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+use std::thread;
 
 // ── Config ──────────────────────────────────────────────────────────────────
 const LAYER_COUNT: usize = 5;
 const STARS_PER_LAYER: [usize; LAYER_COUNT] = [8000, 4000, 2500, 1500, 500];
-const MAX_STARS: usize = 8000 + 4000 + 2500 + 1500 + 500;
+const MAX_STARS: usize = {
+    let mut sum = 0;
+    let mut i = 0;
+    while i < LAYER_COUNT { sum += STARS_PER_LAYER[i]; i += 1; }
+    sum
+};
 const LANDMARK_STARS: usize = 20;
 const FP_SHIFT: i32 = 16;
 const FP_ONE: i32 = 1 << FP_SHIFT;
 const TWINKLE_PERIOD: u32 = 8;
+const TARGET_FPS: f32 = 60.0;
+const FRAME_DT: f32 = 1.0 / TARGET_FPS; // 16.67ms
+const FRAME_DURATION: Duration = Duration::from_micros(16_667);
 
 // ── Layer definitions ───────────────────────────────────────────────────────
 struct LayerDef {
@@ -49,17 +58,37 @@ impl Rng {
 }
 
 // ── Color helpers ───────────────────────────────────────────────────────────
+// Use shifts instead of divides: approximate /255 with >>8 (off by <0.4%)
 #[inline(always)]
 fn dim_color(c: u32, factor: u32) -> u32 {
-    let r = ((c >> 16) & 0xFF) * factor / 255;
-    let g = ((c >>  8) & 0xFF) * factor / 255;
-    let b = ((c      ) & 0xFF) * factor / 255;
+    let r = (((c >> 16) & 0xFF) * factor) >> 8;
+    let g = (((c >>  8) & 0xFF) * factor) >> 8;
+    let b = (( c        & 0xFF) * factor) >> 8;
     0xFF000000 | (r << 16) | (g << 8) | b
 }
 
 #[inline(always)]
 fn fp_from_float(v: f32) -> i32 {
     (v * FP_ONE as f32) as i32
+}
+
+// ── Precomputed landmark colors ─────────────────────────────────────────────
+// Avoid calling dim_color in the hot loop for landmark cross fades.
+// 3 fade levels for cross arms + 1 glow level, computed once at init.
+struct LandmarkColors {
+    cross: [u32; 3], // d=1,2,3 fade levels
+    glow: u32,
+}
+
+fn precompute_landmark() -> LandmarkColors {
+    LandmarkColors {
+        cross: [
+            dim_color(0xFFFFEEDD, 195), // d=1: 255-60
+            dim_color(0xFFFFEEDD, 135), // d=2: 255-120
+            dim_color(0xFFFFEEDD, 75),  // d=3: 255-180
+        ],
+        glow: dim_color(0xFFFFEEDD, 180),
+    }
 }
 
 // ── SoA Starfield ───────────────────────────────────────────────────────────
@@ -70,6 +99,9 @@ struct Starfield {
     speed_y: Vec<i32>,
     color: Vec<u32>,
     base_color: Vec<u32>,
+    // Precomputed dimmed colors for multi-pixel stars (avoids per-frame dim_color)
+    color_edge: Vec<u32>,
+    color_corner: Vec<u32>,
     size: Vec<u8>,
     base_bright: Vec<u8>,
     count: usize,
@@ -79,6 +111,7 @@ struct Starfield {
     height: usize,
     rng: Rng,
     frame: u32,
+    landmark: LandmarkColors,
 }
 
 impl Starfield {
@@ -90,6 +123,8 @@ impl Starfield {
             speed_y: vec![0i32; MAX_STARS],
             color: vec![0u32; MAX_STARS],
             base_color: vec![0u32; MAX_STARS],
+            color_edge: vec![0u32; MAX_STARS],
+            color_corner: vec![0u32; MAX_STARS],
             size: vec![0u8; MAX_STARS],
             base_bright: vec![0u8; MAX_STARS],
             count: 0,
@@ -99,6 +134,7 @@ impl Starfield {
             height: h,
             rng: Rng(0xDEADBEEF),
             frame: 0,
+            landmark: precompute_landmark(),
         };
 
         let mut idx = 0usize;
@@ -129,6 +165,8 @@ impl Starfield {
                 let c = dim_color(ld.color, bright as u32);
                 sf.color[idx] = c;
                 sf.base_color[idx] = c;
+                sf.color_edge[idx] = dim_color(c, 200);
+                sf.color_corner[idx] = dim_color(c, 120);
 
                 // Size
                 sf.size[idx] = if ld.max_size > 0 {
@@ -154,21 +192,31 @@ impl Starfield {
         sf
     }
 
-    fn update(&mut self) {
+    fn update(&mut self, dt: f32) {
         let count = self.count;
         let mx = self.max_x;
         let my = self.max_y;
 
+        // Delta-time scale factor: 1.0 at 60fps, >1 if frame took longer
+        let dt_scale = dt / FRAME_DT;
+        // Convert to fixed-point multiplier (16.16)
+        // We scale speeds by dt_scale. To keep it integer-friendly:
+        // new_x = x + speed * dt_scale
+        // We use a 8.8 fixed-point multiplier for dt_scale to stay in i32
+        let dt_fp8 = (dt_scale * 256.0) as i32;
+
         // Bulk X update — tight loop, auto-vectorizable
         for i in 0..count {
-            self.x[i] += self.speed_x[i];
+            // speed_x[i] is in 16.16 fixed-point per-frame-at-60fps
+            // Multiply by dt_fp8 (8.8) then shift back by 8
+            self.x[i] += (self.speed_x[i] >> 4) * (dt_fp8 >> 4); // avoid overflow
             if self.x[i] >= mx { self.x[i] -= mx; }
             if self.x[i] < 0   { self.x[i] += mx; }
         }
 
         // Bulk Y update
         for i in 0..count {
-            self.y[i] += self.speed_y[i];
+            self.y[i] += (self.speed_y[i] >> 4) * (dt_fp8 >> 4);
             if self.y[i] >= my { self.y[i] -= my; }
             if self.y[i] < 0   { self.y[i] += my; }
         }
@@ -176,6 +224,7 @@ impl Starfield {
         // Twinkle: modulate a subset every N frames
         self.frame += 1;
         if self.frame % TWINKLE_PERIOD == 0 {
+            // Only do ~2300 stars (step_by 7), and only every 8 frames
             for i in (0..count).step_by(7) {
                 let r = self.rng.next();
                 let delta = (r & 0x3F) as i32 - 32;
@@ -187,16 +236,22 @@ impl Starfield {
                 let cb =  c        & 0xFF;
                 let maxc = cr.max(cg).max(cb);
                 if maxc > 0 {
+                    // Use shifts instead of divides
                     let nr = (cr * bright / maxc).min(255);
                     let ng = (cg * bright / maxc).min(255);
                     let nb = (cb * bright / maxc).min(255);
                     self.color[i] = 0xFF000000 | (nr << 16) | (ng << 8) | nb;
+                    // Update precomputed dim colors for multi-pixel stars
+                    if self.size[i] >= 2 {
+                        self.color_edge[i] = dim_color(self.color[i], 200);
+                        self.color_corner[i] = dim_color(self.color[i], 120);
+                    }
                 }
             }
         }
     }
 
-    #[inline(never)] // keep this as a clear compilation unit for the optimizer
+    #[inline(never)]
     fn render(&self, pixels: &mut [u32]) {
         let w = self.width;
         let h = self.height;
@@ -205,18 +260,17 @@ impl Starfield {
         for i in 0..count {
             let px = (self.x[i] >> FP_SHIFT) as usize;
             let py = (self.y[i] >> FP_SHIFT) as usize;
-            let c = self.color[i];
 
             if px >= w || py >= h { continue; }
+
+            let c = self.color[i];
 
             unsafe {
                 match self.size[i] {
                     0 => {
-                        // 1x1 — single pixel, unchecked for speed
                         *pixels.get_unchecked_mut(py * w + px) = c;
                     }
                     1 => {
-                        // 2x2
                         *pixels.get_unchecked_mut(py * w + px) = c;
                         if px + 1 < w {
                             *pixels.get_unchecked_mut(py * w + px + 1) = c;
@@ -229,9 +283,9 @@ impl Starfield {
                         }
                     }
                     2 => {
-                        // 3x3 with dimmed edges/corners
-                        let dc_edge = dim_color(c, 200);
-                        let dc_corner = dim_color(c, 140);
+                        // 3x3 — use precomputed edge/corner colors (no dim_color here)
+                        let dc_edge = self.color_edge[i];
+                        let dc_corner = self.color_corner[i];
                         for dy in 0..3usize {
                             let sy = (py + dy).wrapping_sub(1);
                             if sy >= h { continue; }
@@ -248,16 +302,17 @@ impl Starfield {
                         }
                     }
                     3 => {
-                        // Landmark: bright cross + glow
+                        // Landmark: precomputed cross + glow colors
                         *pixels.get_unchecked_mut(py * w + px) = 0xFFFFFFFF;
-                        for d in 1..=3usize {
-                            let fade = (255 - d * 60) as u32;
-                            let fc = dim_color(0xFFFFEEDD, fade);
-                            if px + d < w { *pixels.get_unchecked_mut(py * w + px + d) = fc; }
-                            if px >= d    { *pixels.get_unchecked_mut(py * w + px - d) = fc; }
-                            if py + d < h { *pixels.get_unchecked_mut((py + d) * w + px) = fc; }
-                            if py >= d    { *pixels.get_unchecked_mut((py - d) * w + px) = fc; }
+                        for d in 0..3usize {
+                            let fc = self.landmark.cross[d];
+                            let d1 = d + 1;
+                            if px + d1 < w { *pixels.get_unchecked_mut(py * w + px + d1) = fc; }
+                            if px >= d1    { *pixels.get_unchecked_mut(py * w + px - d1) = fc; }
+                            if py + d1 < h { *pixels.get_unchecked_mut((py + d1) * w + px) = fc; }
+                            if py >= d1    { *pixels.get_unchecked_mut((py - d1) * w + px) = fc; }
                         }
+                        let glow = self.landmark.glow;
                         for dy in 0..3usize {
                             let sy = (py + dy).wrapping_sub(1);
                             if sy >= h { continue; }
@@ -265,7 +320,6 @@ impl Starfield {
                                 let sx = (px + dx).wrapping_sub(1);
                                 if sx >= w { continue; }
                                 if dx == 1 && dy == 1 { continue; }
-                                let glow = dim_color(0xFFFFEEDD, 180);
                                 let pidx = sy * w + sx;
                                 if *pixels.get_unchecked(pidx) < glow {
                                     *pixels.get_unchecked_mut(pidx) = glow;
@@ -296,12 +350,23 @@ const FONT3X5: [[u8; 5]; 10] = [
 
 fn draw_fps(pixels: &mut [u32], w: usize, x: usize, y: usize, fps: u32, scale: usize) {
     let color = 0xFF44FF44u32;
-    let s = format!("{fps}");
-    for (ci, ch) in s.chars().enumerate() {
-        let digit = match ch.to_digit(10) {
-            Some(d) => d as usize,
-            None => continue,
-        };
+    // Extract digits without allocation
+    let mut digits = [0u8; 4];
+    let mut n = fps;
+    let mut len = 0;
+    if n == 0 {
+        digits[0] = 0;
+        len = 1;
+    } else {
+        while n > 0 && len < 4 {
+            digits[len] = (n % 10) as u8;
+            n /= 10;
+            len += 1;
+        }
+        digits[..len].reverse();
+    }
+    for ci in 0..len {
+        let digit = digits[ci] as usize;
         let ox = x + ci * 4 * scale;
         for row in 0..5usize {
             let bits = FONT3X5[digit][row];
@@ -342,7 +407,8 @@ fn main() {
     )
     .expect("Failed to create window");
 
-    window.set_target_fps(60);
+    // Don't use minifb's frame limiter — we do our own precise timing
+    window.set_target_fps(0);
 
     let mut pixels = vec![0u32; width * height];
     let mut sf = Starfield::new(width, height);
@@ -350,11 +416,18 @@ fn main() {
     let mut fps: u32 = 0;
     let mut frame_count: u32 = 0;
     let mut fps_timer = Instant::now();
+    let mut frame_start = Instant::now();
 
     eprintln!("Stargazer: {}x{}, {} stars", width, height, sf.count);
 
     while window.is_open() && !window.is_key_down(Key::Escape) && !window.is_key_down(Key::Q) {
-        sf.update();
+        let now = Instant::now();
+        let raw_dt = now.duration_since(frame_start).as_secs_f32();
+        // Clamp dt to avoid spiral-of-death if a frame takes way too long
+        let dt = raw_dt.min(0.05); // max 50ms = 20fps floor
+        frame_start = now;
+
+        sf.update(dt);
 
         // Clear
         pixels.fill(0);
@@ -372,8 +445,24 @@ fn main() {
         }
         draw_fps(&mut pixels, width, 10, 10, fps, 2);
 
-        // Upload buffer and present
+        // Upload buffer and present (minifb does its own
+        // internal buffer copy here — this is the
+        // "upload to window" step)
         window.update_with_buffer(&pixels, width, height)
             .expect("Failed to update window");
+
+        // Precise frame cap: sleep for remaining time
+        let work_time = frame_start.elapsed();
+        if work_time < FRAME_DURATION {
+            let sleep_time = FRAME_DURATION - work_time;
+            // Sleep most of the time, then spin for the last ~1ms for precision
+            if sleep_time > Duration::from_millis(2) {
+                thread::sleep(sleep_time - Duration::from_millis(1));
+            }
+            // Spin-wait for the remainder (sub-ms precision)
+            while frame_start.elapsed() < FRAME_DURATION {
+                std::hint::spin_loop();
+            }
+        }
     }
 }

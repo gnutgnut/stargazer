@@ -94,21 +94,21 @@ install_zig_as_linker() {
     # Write the wrapper script and cargo config
     local ZIGCC="${SCRIPT_DIR}/zigcc.sh"
     cat > "${ZIGCC}" <<'ZIGEOF'
-#!/bin/sh
+#!/bin/bash
 ZIG="${HOME}/.local/bin/zig"
-args=""
+args=()
 for arg in "$@"; do
     case "$arg" in
         --target=*-unknown-linux-gnu)
             triple="$(echo "$arg" | sed 's/--target=//;s/-unknown-linux-gnu/-linux-gnu/')"
-            args="$args --target=$triple"
+            args+=("--target=$triple")
             ;;
         *)
-            args="$args $arg"
+            args+=("$arg")
             ;;
     esac
 done
-exec "$ZIG" cc $args
+exec "$ZIG" cc "${args[@]}"
 ZIGEOF
     chmod +x "${ZIGCC}"
 
@@ -151,7 +151,11 @@ fi
 info "Building stargazer (release)..."
 cd "${SCRIPT_DIR}"
 export PATH="${HOME}/.local/bin:${PATH}"
-CC="${SCRIPT_DIR}/zigcc.sh" cargo build --release 2>&1
+if [[ -x "${SCRIPT_DIR}/zigcc.sh" ]]; then
+    CC="${SCRIPT_DIR}/zigcc.sh" cargo build --release 2>&1
+else
+    cargo build --release 2>&1
+fi
 
 info "Done! Run with:"
 echo "  ./target/release/stargazer"
