@@ -23,13 +23,13 @@ const FRAME_DURATION: Duration = Duration::from_micros(16_667);
 const WIDTH: usize = 1280;
 const HEIGHT: usize = 720;
 
-// Adaptive star count: frame budget threshold for scaling
-const BUDGET_MS: f32 = 15.0;  // if avg frame >15ms, shed stars
-const GROW_MS: f32 = 12.0;    // if avg frame <12ms, grow back
-const SHED_STEP: usize = 2000; // shed aggressively to recover fast
-const GROW_STEP: usize = 500;  // grow back gently to avoid oscillation
+// Adaptive star count
+const BUDGET_MS: f32 = 15.0;
+const GROW_MS: f32 = 12.0;
+const SHED_STEP: usize = 2000;
+const GROW_STEP: usize = 500;
 const MIN_STARS: usize = 2000;
-const ADJUST_INTERVAL: u32 = 15; // check every 15 frames (~0.25s)
+const ADJUST_INTERVAL: u32 = 15;
 
 // ── Layer definitions ───────────────────────────────────────────────────────
 struct LayerDef {
@@ -101,8 +101,8 @@ fn precompute_landmark() -> LandmarkColors {
 }
 
 // ── SoA Starfield ───────────────────────────────────────────────────────────
-// Stars are sorted by size group at init so the render loop can process
-// each group in a tight branch-free pass. Group boundaries stored in `groups`.
+// Stars sorted by size at init. Render processes each group in a dedicated
+// loop — no branching on size[i] in the hot path.
 //
 // To add a new per-star field:
 // 1. Add Vec<T> here  2. Init in new()  3. Set in init loop
@@ -118,11 +118,9 @@ struct Starfield {
     color_corner: Vec<u32>,
     size: Vec<u8>,
     base_bright: Vec<u8>,
-    count: usize,        // total allocated stars
-    active: usize,       // currently rendered (adaptive, <= count)
-    active_groups: [usize; 5], // group boundaries for active subset
-    // Group boundaries for all stars: groups[s] is the start index of size s.
-    // groups[4] == count (sentinel).
+    count: usize,
+    active: usize,
+    active_groups: [usize; 5],
     groups: [usize; 5],
     max_x: i32,
     max_y: i32,
@@ -131,9 +129,6 @@ struct Starfield {
     rng: Rng,
     frame: u32,
     landmark: LandmarkColors,
-    // Dirty pixel tracking: indices into the pixel buffer that were written
-    // last frame. Cleared instead of full-buffer memset.
-    dirty: Vec<u32>,
 }
 
 impl Starfield {
@@ -160,9 +155,6 @@ impl Starfield {
             rng: Rng(0xDEADBEEF),
             frame: 0,
             landmark: precompute_landmark(),
-            // Generous initial capacity: most stars are 1px so ~MAX_STARS writes,
-            // plus multi-pixel stars add a few more. Avoids realloc during render.
-            dirty: Vec::with_capacity(MAX_STARS + 5000),
         };
 
         let mut idx = 0usize;
@@ -213,9 +205,6 @@ impl Starfield {
         }
 
         sf.count = idx;
-
-        // Sort all star arrays by size group so render can process each
-        // group in a tight loop without branching on size[i].
         sf.sort_by_size();
         sf.active = sf.count;
         sf.recompute_active_groups();
@@ -223,15 +212,11 @@ impl Starfield {
         sf
     }
 
-    /// Sort all SoA arrays by size, then compute group boundaries.
     fn sort_by_size(&mut self) {
         let n = self.count;
-        // Build permutation indices sorted by size (stable sort preserves
-        // layer ordering within each size group).
         let mut perm: Vec<usize> = (0..n).collect();
         perm.sort_by_key(|&i| self.size[i]);
 
-        // Apply permutation to every SoA array via a temp copy.
         macro_rules! apply_perm {
             ($field:expr) => {{
                 let old: Vec<_> = $field[..n].to_vec();
@@ -251,29 +236,19 @@ impl Starfield {
         apply_perm!(self.size);
         apply_perm!(self.base_bright);
 
-        // Compute group boundaries
-        // groups[0] = start of size-0, groups[1] = start of size-1, etc.
-        // groups[4] = count (end sentinel)
-        self.groups = [n; 5]; // default all to end
+        self.groups = [n; 5];
         let mut current_size = 255u8;
         for i in 0..n {
             let s = self.size[i];
             if s != current_size {
-                // Fill all group starts from current_size+1 to s
                 let from = if current_size == 255 { 0 } else { current_size as usize + 1 };
                 for g in from..=s as usize {
-                    if g < 5 {
-                        self.groups[g] = i;
-                    }
+                    if g < 5 { self.groups[g] = i; }
                 }
                 current_size = s;
             }
         }
-        // Sentinel
-        if 4 < 5 {
-            self.groups[4] = n;
-        }
-        // Fill any missing groups (sizes with 0 stars point to next group's start)
+        self.groups[4] = n;
         for g in (0..4).rev() {
             if self.groups[g] > self.groups[g + 1] {
                 self.groups[g] = self.groups[g + 1];
@@ -281,22 +256,16 @@ impl Starfield {
         }
     }
 
-    /// Recompute active_groups by clamping each group boundary to active count.
-    /// Stars are sorted by size, so reducing active count sheds the largest
-    /// (most expensive) stars first — landmarks, then 3x3, then 2x2.
     fn recompute_active_groups(&mut self) {
         let a = self.active;
         for g in 0..5 {
             self.active_groups[g] = self.groups[g].min(a);
         }
-        // Sentinel
         self.active_groups[4] = a.min(self.groups[4]);
     }
 
-    /// Adaptive star count: shed stars if over budget, grow if under.
     fn adjust_count(&mut self, avg_frame_ms: f32) {
         if avg_frame_ms > BUDGET_MS && self.active > MIN_STARS {
-            // Shed aggressively — proportional to how far over budget
             let overshoot = ((avg_frame_ms - BUDGET_MS) / BUDGET_MS * SHED_STEP as f32) as usize;
             let step = overshoot.max(SHED_STEP);
             self.active = self.active.saturating_sub(step).max(MIN_STARS);
@@ -308,14 +277,13 @@ impl Starfield {
     }
 
     fn update(&mut self, dt: f32) {
-        let count = self.active; // only update active stars
+        let count = self.active;
         let mx = self.max_x;
         let my = self.max_y;
 
         let dt_scale = dt / FRAME_DT;
         let dt_fp8 = (dt_scale * 256.0) as i32;
 
-        // Bulk X update — local var helps autovectorizer keep value in register
         let x = &mut self.x[..count];
         let sx = &self.speed_x[..count];
         for i in 0..count {
@@ -325,7 +293,6 @@ impl Starfield {
             x[i] = v;
         }
 
-        // Bulk Y update
         let y = &mut self.y[..count];
         let sy = &self.speed_y[..count];
         for i in 0..count {
@@ -335,7 +302,6 @@ impl Starfield {
             y[i] = v;
         }
 
-        // Twinkle
         self.frame += 1;
         if self.frame % TWINKLE_PERIOD == 0 {
             for i in (0..count).step_by(7) {
@@ -362,30 +328,18 @@ impl Starfield {
         }
     }
 
-    /// Clear only the pixels we drew last frame (dirty-list clear).
-    /// Much faster than `pixels.fill(0)` when star coverage is <3% of screen.
-    fn clear_dirty(&mut self, pixels: &mut [u32]) {
-        for &idx in &self.dirty {
-            unsafe { *pixels.get_unchecked_mut(idx as usize) = 0; }
-        }
-        self.dirty.clear();
-    }
-
     #[inline(never)]
-    fn render(&mut self, pixels: &mut [u32]) {
+    fn render(&self, pixels: &mut [u32]) {
         let w = self.width;
         let h = self.height;
         let groups = self.active_groups;
 
         // ── Size 0: single pixel ────────────────────────────────────────
-        // Tightest possible loop — no branching on size, no multi-pixel logic.
         for i in groups[0]..groups[1] {
             let px = (self.x[i] >> FP_SHIFT) as usize;
             let py = (self.y[i] >> FP_SHIFT) as usize;
             if px >= w || py >= h { continue; }
-            let idx = py * w + px;
-            unsafe { *pixels.get_unchecked_mut(idx) = self.color[i]; }
-            self.dirty.push(idx as u32);
+            unsafe { *pixels.get_unchecked_mut(py * w + px) = self.color[i]; }
         }
 
         // ── Size 1: 2x2 ────────────────────────────────────────────────
@@ -395,23 +349,11 @@ impl Starfield {
             if px >= w || py >= h { continue; }
             let c = self.color[i];
             unsafe {
-                let idx = py * w + px;
-                *pixels.get_unchecked_mut(idx) = c;
-                self.dirty.push(idx as u32);
-                if px + 1 < w {
-                    let idx = py * w + px + 1;
-                    *pixels.get_unchecked_mut(idx) = c;
-                    self.dirty.push(idx as u32);
-                }
+                *pixels.get_unchecked_mut(py * w + px) = c;
+                if px + 1 < w { *pixels.get_unchecked_mut(py * w + px + 1) = c; }
                 if py + 1 < h {
-                    let idx = (py + 1) * w + px;
-                    *pixels.get_unchecked_mut(idx) = c;
-                    self.dirty.push(idx as u32);
-                    if px + 1 < w {
-                        let idx = (py + 1) * w + px + 1;
-                        *pixels.get_unchecked_mut(idx) = c;
-                        self.dirty.push(idx as u32);
-                    }
+                    *pixels.get_unchecked_mut((py + 1) * w + px) = c;
+                    if px + 1 < w { *pixels.get_unchecked_mut((py + 1) * w + px + 1) = c; }
                 }
             }
         }
@@ -431,14 +373,10 @@ impl Starfield {
                     for dx in 0..3usize {
                         let sx = (px + dx).wrapping_sub(1);
                         if sx >= w { continue; }
-                        let is_corner = dx != 1 && dy != 1;
-                        let is_center = dx == 1 && dy == 1;
-                        let pc = if is_center { c }
-                                 else if is_corner { dc_corner }
+                        let pc = if dx == 1 && dy == 1 { c }
+                                 else if dx != 1 && dy != 1 { dc_corner }
                                  else { dc_edge };
-                        let idx = sy * w + sx;
-                        *pixels.get_unchecked_mut(idx) = pc;
-                        self.dirty.push(idx as u32);
+                        *pixels.get_unchecked_mut(sy * w + sx) = pc;
                     }
                 }
             }
@@ -450,32 +388,14 @@ impl Starfield {
             let py = (self.y[i] >> FP_SHIFT) as usize;
             if px >= w || py >= h { continue; }
             unsafe {
-                let idx = py * w + px;
-                *pixels.get_unchecked_mut(idx) = 0xFFFFFFFF;
-                self.dirty.push(idx as u32);
+                *pixels.get_unchecked_mut(py * w + px) = 0xFFFFFFFF;
                 for d in 0..3usize {
                     let fc = self.landmark.cross[d];
                     let d1 = d + 1;
-                    if px + d1 < w {
-                        let idx = py * w + px + d1;
-                        *pixels.get_unchecked_mut(idx) = fc;
-                        self.dirty.push(idx as u32);
-                    }
-                    if px >= d1 {
-                        let idx = py * w + px - d1;
-                        *pixels.get_unchecked_mut(idx) = fc;
-                        self.dirty.push(idx as u32);
-                    }
-                    if py + d1 < h {
-                        let idx = (py + d1) * w + px;
-                        *pixels.get_unchecked_mut(idx) = fc;
-                        self.dirty.push(idx as u32);
-                    }
-                    if py >= d1 {
-                        let idx = (py - d1) * w + px;
-                        *pixels.get_unchecked_mut(idx) = fc;
-                        self.dirty.push(idx as u32);
-                    }
+                    if px + d1 < w { *pixels.get_unchecked_mut(py * w + px + d1) = fc; }
+                    if px >= d1    { *pixels.get_unchecked_mut(py * w + px - d1) = fc; }
+                    if py + d1 < h { *pixels.get_unchecked_mut((py + d1) * w + px) = fc; }
+                    if py >= d1    { *pixels.get_unchecked_mut((py - d1) * w + px) = fc; }
                 }
                 let glow = self.landmark.glow;
                 for dy in 0..3usize {
@@ -485,9 +405,7 @@ impl Starfield {
                         let sx = (px + dx).wrapping_sub(1);
                         if sx >= w { continue; }
                         if dx == 1 && dy == 1 { continue; }
-                        let idx = sy * w + sx;
-                        *pixels.get_unchecked_mut(idx) = glow;
-                        self.dirty.push(idx as u32);
+                        *pixels.get_unchecked_mut(sy * w + sx) = glow;
                     }
                 }
             }
@@ -509,7 +427,6 @@ const FONT3X5: [[u8; 5]; 10] = [
     [0x7,0x5,0x7,0x1,0x7],
 ];
 
-/// Draw a number at (x,y) with given color and pixel scale. Returns width in pixels.
 fn draw_num(pixels: &mut [u32], w: usize, x: usize, y: usize, val: u32, color: u32, scale: usize) -> usize {
     let mut digits = [0u8; 6];
     let mut n = val;
@@ -549,7 +466,6 @@ fn draw_num(pixels: &mut [u32], w: usize, x: usize, y: usize, val: u32, color: u
     len * 4 * scale
 }
 
-/// Clear a rectangle in the pixel buffer to black.
 fn clear_rect(pixels: &mut [u32], w: usize, x: usize, y: usize, rw: usize, rh: usize) {
     for row in y..y + rh {
         if row >= pixels.len() / w { break; }
@@ -565,7 +481,7 @@ const HUD_ENTRIES: usize = 3;
 
 struct Hud {
     prev_vals: [u32; HUD_ENTRIES],
-    fade: [u8; HUD_ENTRIES],  // 255 = full bright, decays toward floor
+    fade: [u8; HUD_ENTRIES],
     base_colors: [u32; HUD_ENTRIES],
 }
 
@@ -574,41 +490,31 @@ impl Hud {
         Self {
             prev_vals: [u32::MAX; HUD_ENTRIES],
             fade: [255; HUD_ENTRIES],
-            base_colors: [
-                0xFF44FF44, // FPS: green
-                0xFF44AAAA, // stars: cyan
-                0xFFFF4444, // drops: red
-            ],
+            base_colors: [0xFF44FF44, 0xFF44AAAA, 0xFFFF4444],
         }
     }
 
     fn draw(&mut self, pixels: &mut [u32], w: usize, vals: [u32; HUD_ENTRIES]) {
-        let y: usize = 12;
-        let scale: usize = 3;
-        let gap: usize = 8 * scale;
-        // Max possible HUD width: 3 numbers × 6 digits × 4px × scale + gaps
+        let y: usize = 10;
+        let scale: usize = 2;
+        let gap: usize = 3 * scale;
         let hud_h = 5 * scale + 4;
         let hud_w = 3 * 6 * 4 * scale + 2 * gap + 8;
 
-        // Clear entire HUD background so old digits don't ghost
         clear_rect(pixels, w, 8, if y > 1 { y - 1 } else { 0 }, hud_w, hud_h);
 
         let mut x = 10;
         for entry in 0..HUD_ENTRIES {
             let val = vals[entry];
-
-            // Changed? flash bright
             if val != self.prev_vals[entry] {
                 self.fade[entry] = 255;
                 self.prev_vals[entry] = val;
             } else {
-                // Decay toward dim floor (40 for active elements, 20 for zero drops)
                 let floor: u8 = if entry == 2 && val == 0 { 15 } else { 50 };
                 if self.fade[entry] > floor {
                     self.fade[entry] = self.fade[entry].saturating_sub(4);
                 }
             }
-
             let color = dim_color(self.base_colors[entry], self.fade[entry] as u32);
             x += draw_num(pixels, w, x, y, val, color, scale) + gap;
         }
@@ -675,25 +581,18 @@ fn main() {
 
         sf.update(dt);
 
-        // Dirty-list clear: zero only the pixels we drew last frame
-        sf.clear_dirty(&mut pixels);
-
-        // Render stars into pixel buffer
+        pixels.fill(0);
         sf.render(&mut pixels);
 
-        // HUD: FPS (green) | star count (cyan) | drops/sec (red)
-        // Fades when stable, flashes bright on change, clears background
         hud.draw(&mut pixels, WIDTH, [fps, sf.active as u32, drop_count]);
 
         window.update_with_buffer(&pixels, WIDTH, HEIGHT)
             .expect("Failed to update window");
 
-        // Measure TOTAL frame time including the buffer copy above.
-        // This is the real cost — if this exceeds 16.67ms we drop frames.
+        // Measure TOTAL frame time including buffer copy
         let total_frame_ms = frame_start.elapsed().as_secs_f32() * 1000.0;
         work_ms_accum += total_frame_ms;
 
-        // FPS & drop counter (use raw_dt which is previous frame's total time)
         frame_count += 1;
         if raw_dt > FRAME_DT * 1.3 {
             total_drops += 1;
@@ -707,7 +606,6 @@ fn main() {
             fps_timer = Instant::now();
         }
 
-        // Adaptive star count: check every ADJUST_INTERVAL frames
         adjust_counter += 1;
         let mut adjusted = false;
         if adjust_counter >= ADJUST_INTERVAL {
