@@ -7,9 +7,9 @@ pub const MAX_STARS: usize = {
     while i < LAYER_COUNT { sum += STARS_PER_LAYER[i]; i += 1; }
     sum
 };
-// Ceiling for upward scaling — allocate room for 3x the default count.
+// Ceiling for upward scaling — allocate room for 6x the default count.
 // Extra stars are spawned as 1px dots when the system has headroom.
-pub const STAR_CEILING: usize = MAX_STARS * 3;
+pub const STAR_CEILING: usize = MAX_STARS * 6;
 const LANDMARK_STARS: usize = 20;
 pub const FP_SHIFT: i32 = 16;
 pub const FP_ONE: i32 = 1 << FP_SHIFT;
@@ -120,7 +120,7 @@ pub struct Starfield {
     base_bright: Vec<u8>,
     pub count: usize,
     pub active: usize,
-    active_groups: [usize; 5],
+    pub active_groups: [usize; 5],
     pub groups: [usize; 5],
     max_x: i32,
     max_y: i32,
@@ -255,27 +255,47 @@ impl Starfield {
     }
 
     pub fn recompute_active_groups(&mut self) {
-        let a = self.active;
-        for g in 0..5 {
-            self.active_groups[g] = self.groups[g].min(a);
-        }
-        self.active_groups[4] = a.min(self.groups[4]);
+        // Stars are sorted: [size-0 ... | size-1 ... | size-2 ... | size-3 ...]
+        // groups[0]=0, groups[1]=start of size-1, groups[2]=start of size-2, etc.
+        //
+        // When shedding, we reduce the size-0 (1px) count — the cheapest stars.
+        // Multi-pixel stars (size 1-3) are always fully rendered.
+        // When growing, we add more size-0 stars.
+        let total_multi = self.count - self.groups[1]; // size-1 + size-2 + size-3
+        let max_size0 = if self.active > total_multi {
+            self.active - total_multi
+        } else {
+            0
+        };
+        // Size-0 range: groups[0]..groups[1], clamped to max_size0
+        let size0_end = self.groups[0] + max_size0.min(self.groups[1] - self.groups[0]);
+
+        self.active_groups[0] = self.groups[0]; // always 0
+        self.active_groups[1] = size0_end;      // end of active size-0 stars
+        // All multi-pixel groups render fully (shift them to follow the active size-0 block)
+        self.active_groups[1] = size0_end;
+        self.active_groups[2] = self.groups[2].min(self.count);
+        self.active_groups[3] = self.groups[3].min(self.count);
+        self.active_groups[4] = self.groups[4].min(self.count);
     }
 
-    pub fn adjust_count(&mut self, avg_frame_ms: f32) {
+    pub fn adjust_count(&mut self, avg_frame_ms: f32) -> bool {
         if avg_frame_ms > BUDGET_MS && self.active > MIN_STARS {
             let overshoot = ((avg_frame_ms - BUDGET_MS) / BUDGET_MS * SHED_STEP as f32) as usize;
             let step = overshoot.max(SHED_STEP);
             self.active = self.active.saturating_sub(step).max(MIN_STARS);
             self.recompute_active_groups();
+            true
         } else if avg_frame_ms < GROW_MS && self.active < STAR_CEILING {
-            // Grow: if we need more stars than currently spawned, spawn them
             let new_active = (self.active + GROW_STEP).min(STAR_CEILING);
             if new_active > self.count {
                 self.spawn_extra(new_active - self.count);
             }
             self.active = new_active;
             self.recompute_active_groups();
+            true
+        } else {
+            false
         }
     }
 
@@ -284,29 +304,46 @@ impl Starfield {
     fn spawn_extra(&mut self, n: usize) {
         let w = self.width;
         let h = self.height;
-        // Use the far-layer color for extra stars (dim background dots)
-        let _base_color = LAYERS[0].color;
-        let insert_at = self.count; // append at end (all size-0 are at the front)
+        let insert_at = self.count;
 
         for j in 0..n {
             let idx = insert_at + j;
             if idx >= STAR_CEILING { break; }
+
+            // Pick a random layer so extras span all depths
+            let l = self.rng.range(LAYER_COUNT as u32) as usize;
+            let ld = &LAYERS[l];
+
             self.x[idx] = (self.rng.range(w as u32) as i32) << FP_SHIFT;
             self.y[idx] = (self.rng.range(h as u32) as i32) << FP_SHIFT;
-            // Random speed in the range of layers 0-2
-            let spd = fp_from_float(0.15 + (self.rng.range(100) as f32) * 0.01);
-            self.speed_x[idx] = spd.max(1);
-            self.speed_y[idx] = 0;
-            let bright = 30 + self.rng.range(70) as u8;
+
+            let spd_x = fp_from_float(ld.speed_x);
+            let vary_range = (spd_x / 4).unsigned_abs().max(1);
+            let vary = self.rng.range(vary_range) as i32;
+            self.speed_x[idx] = (spd_x - spd_x / 8 + vary).max(1);
+
+            let spd_y = fp_from_float(ld.drift_y);
+            if spd_y > 0 {
+                let vy = self.rng.range((spd_y as u32).wrapping_mul(2).max(1)) as i32;
+                self.speed_y[idx] = vy - spd_y;
+            } else {
+                self.speed_y[idx] = 0;
+            }
+
+            let bright_range = (ld.bright_hi - ld.bright_lo + 1) as u32;
+            let bright = ld.bright_lo + self.rng.range(bright_range) as u8;
             self.base_bright[idx] = bright;
-            // DEBUG: alternate red/green so new stars are visible
-            let debug_color = if j % 2 == 0 { 0xFFFF4444 } else { 0xFF44FF44 };
+
+            // DEBUG: tint extras red/green so they're visually identifiable
+            let debug_color = if j % 2 == 0 { 0xFFFF6644 } else { 0xFF44FF66 };
             let c = dim_color(debug_color, bright as u32);
             self.color[idx] = c;
             self.base_color[idx] = c;
-            self.color_edge[idx] = 0;
-            self.color_corner[idx] = 0;
-            self.size[idx] = 0; // always 1px
+            self.color_edge[idx] = dim_color(c, 200);
+            self.color_corner[idx] = dim_color(c, 120);
+
+            // Extras are always 1px for now (cheapest)
+            self.size[idx] = 0;
         }
         let added = n.min(STAR_CEILING - self.count);
         self.count += added;

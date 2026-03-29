@@ -97,10 +97,10 @@ fn main() {
         if adjust_counter >= ADJUST_INTERVAL {
             let avg_frame = work_ms_accum / adjust_counter as f32;
             let before = sf.active;
-            sf.adjust_count(avg_frame);
-            adjusted = sf.active != before;
+            adjusted = sf.adjust_count(avg_frame);
             if adjusted {
-                eprintln!("adapt: avg={:.1}ms  {} -> {} stars", avg_frame, before, sf.active);
+                eprintln!("adapt: avg={:.1}ms  {} -> {} stars  count={}  groups={:?}  active_groups={:?}",
+                    avg_frame, before, sf.active, sf.count, sf.groups, sf.active_groups);
             }
             work_ms_accum = 0.0;
             adjust_counter = 0;

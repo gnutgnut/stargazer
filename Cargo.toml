@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [lib]
+name = "stargazer_web"
+path = "src/lib.rs"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
