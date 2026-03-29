@@ -99,6 +99,9 @@ fn main() {
             let before = sf.active;
             sf.adjust_count(avg_frame);
             adjusted = sf.active != before;
+            if adjusted {
+                eprintln!("adapt: avg={:.1}ms  {} -> {} stars", avg_frame, before, sf.active);
+            }
             work_ms_accum = 0.0;
             adjust_counter = 0;
         }
