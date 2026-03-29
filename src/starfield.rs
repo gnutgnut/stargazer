@@ -89,6 +89,48 @@ pub fn argb_to_rgba(argb: &[u32], rgba: &mut [u8]) {
     }
 }
 
+// ── Banner font (7x9 bitmap) ────────────────────────────────────────────────
+#[rustfmt::skip]
+const BANNER_FONT: &[(u8, [u8; 9])] = &[
+    (b'S', [0b0111110, 0b1000001, 0b1000000, 0b0111100, 0b0000010, 0b0000001, 0b1000001, 0b0111110, 0b0000000]),
+    (b'T', [0b1111111, 0b0001000, 0b0001000, 0b0001000, 0b0001000, 0b0001000, 0b0001000, 0b0001000, 0b0000000]),
+    (b'A', [0b0011100, 0b0100010, 0b1000001, 0b1000001, 0b1111111, 0b1000001, 0b1000001, 0b1000001, 0b0000000]),
+    (b'R', [0b1111110, 0b1000001, 0b1000001, 0b1111110, 0b1001000, 0b1000100, 0b1000010, 0b1000001, 0b0000000]),
+    (b'G', [0b0111110, 0b1000001, 0b1000000, 0b1000000, 0b1001111, 0b1000001, 0b1000001, 0b0111110, 0b0000000]),
+    (b'Z', [0b1111111, 0b0000010, 0b0000100, 0b0001000, 0b0010000, 0b0100000, 0b1000000, 0b1111111, 0b0000000]),
+    (b'E', [0b1111111, 0b1000000, 0b1000000, 0b1111100, 0b1000000, 0b1000000, 0b1000000, 0b1111111, 0b0000000]),
+    (b'v', [0b0000000, 0b0000000, 0b1000001, 0b0100010, 0b0100010, 0b0010100, 0b0010100, 0b0001000, 0b0000000]),
+    (b'0', [0b0111110, 0b1000001, 0b1000011, 0b1000101, 0b1001001, 0b1010001, 0b1100001, 0b0111110, 0b0000000]),
+    (b'1', [0b0001000, 0b0011000, 0b0101000, 0b0001000, 0b0001000, 0b0001000, 0b0001000, 0b0111110, 0b0000000]),
+    (b'.', [0b0000000, 0b0000000, 0b0000000, 0b0000000, 0b0000000, 0b0000000, 0b0011000, 0b0011000, 0b0000000]),
+    (b' ', [0b0000000, 0b0000000, 0b0000000, 0b0000000, 0b0000000, 0b0000000, 0b0000000, 0b0000000, 0b0000000]),
+];
+
+const BANNER_CHAR_W: usize = 7;
+const BANNER_CHAR_H: usize = 9;
+const BANNER_SCALE: usize = 10;
+const _BANNER_SPACING: usize = 3; // gap in font pixels between chars
+const BANNER_DENSITY: usize = 3; // stars per "on" pixel
+const BANNER_FRAMES_PER_CHAR: u32 = 20; // ~0.33s between letters at 60fps
+
+struct BannerQueue {
+    text: &'static [u8],
+    next_char: usize,      // index into text
+    frames_until_next: u32, // countdown
+    done: bool,
+}
+
+impl BannerQueue {
+    fn new(text: &'static [u8]) -> Self {
+        Self {
+            text,
+            next_char: 0,
+            frames_until_next: 60, // ~1 second delay before first letter
+            done: false,
+        }
+    }
+}
+
 // ── Precomputed landmark colors ─────────────────────────────────────────────
 struct LandmarkColors {
     cross: [u32; 3],
@@ -129,6 +171,10 @@ pub struct Starfield {
     rng: Rng,
     frame: u32,
     landmark: LandmarkColors,
+    // Banner system: stars with index >= banner_start are one-shot banner stars.
+    // They get killed (swapped to invisible) when they scroll off the left edge.
+    banner_start: usize, // index where banner stars begin (count at time of first banner spawn)
+    banner: BannerQueue,
 }
 
 impl Starfield {
@@ -155,6 +201,8 @@ impl Starfield {
             rng: Rng(0xDEADBEEF),
             frame: 0,
             landmark: precompute_landmark(),
+            banner_start: 0,
+            banner: BannerQueue::new(b"STARGAZER v0.1.0"),
         };
 
         let mut idx = 0usize;
@@ -204,113 +252,126 @@ impl Starfield {
         }
 
         sf.count = idx;
+        sf.banner_start = idx; // banner stars will go after this index
         sf.sort_by_size();
-        sf.active = sf.count;
+        // Start sparse — field fills in while banner scrolls
+        sf.active = MIN_STARS + 3000;
         sf.recompute_active_groups();
-
-        // Spawn the intro banner — stars forming "STARGAZER" that scroll in
-        sf.spawn_banner(w, h);
-
         sf
     }
 
-    /// Spawn stars that form the text "STARGAZER v0.1.0".
-    /// Stars are placed off-screen to the right at a mid-layer speed,
-    /// so they scroll in naturally, linger, and dissolve into the field.
-    fn spawn_banner(&mut self, w: usize, h: usize) {
-        // 7-wide x 9-tall bitmap font — each char is 9 bytes, 7 bits per row
-        #[rustfmt::skip]
-        let font: &[(u8, [u8; 9])] = &[
-            (b'S', [0b0111110, 0b1000001, 0b1000000, 0b0111100, 0b0000010, 0b0000001, 0b1000001, 0b0111110, 0b0000000]),
-            (b'T', [0b1111111, 0b0001000, 0b0001000, 0b0001000, 0b0001000, 0b0001000, 0b0001000, 0b0001000, 0b0000000]),
-            (b'A', [0b0011100, 0b0100010, 0b1000001, 0b1000001, 0b1111111, 0b1000001, 0b1000001, 0b1000001, 0b0000000]),
-            (b'R', [0b1111110, 0b1000001, 0b1000001, 0b1111110, 0b1001000, 0b1000100, 0b1000010, 0b1000001, 0b0000000]),
-            (b'G', [0b0111110, 0b1000001, 0b1000000, 0b1000000, 0b1001111, 0b1000001, 0b1000001, 0b0111110, 0b0000000]),
-            (b'Z', [0b1111111, 0b0000010, 0b0000100, 0b0001000, 0b0010000, 0b0100000, 0b1000000, 0b1111111, 0b0000000]),
-            (b'E', [0b1111111, 0b1000000, 0b1000000, 0b1111100, 0b1000000, 0b1000000, 0b1000000, 0b1111111, 0b0000000]),
-            (b'v', [0b0000000, 0b0000000, 0b1000001, 0b0100010, 0b0100010, 0b0010100, 0b0010100, 0b0001000, 0b0000000]),
-            (b'0', [0b0111110, 0b1000001, 0b1000011, 0b1000101, 0b1001001, 0b1010001, 0b1100001, 0b0111110, 0b0000000]),
-            (b'1', [0b0001000, 0b0011000, 0b0101000, 0b0001000, 0b0001000, 0b0001000, 0b0001000, 0b0111110, 0b0000000]),
-            (b'.', [0b0000000, 0b0000000, 0b0000000, 0b0000000, 0b0000000, 0b0000000, 0b0011000, 0b0011000, 0b0000000]),
-            (b' ', [0b0000000, 0b0000000, 0b0000000, 0b0000000, 0b0000000, 0b0000000, 0b0000000, 0b0000000, 0b0000000]),
-        ];
+    /// Called each frame from update(). Spawns the next banner letter when ready.
+    fn tick_banner(&mut self) {
+        if self.banner.done { return; }
 
-        let text = b"STARGAZER v0.1.0";
-        let char_w = 7;     // font width
-        let char_h = 9;     // font height
-        let scale = 10;     // pixels per font pixel — big and bold
-        let spacing = 3;    // gap between chars in font pixels
-        let star_density = 3; // stars per "on" pixel (denser = brighter letters)
+        if self.banner.frames_until_next > 0 {
+            self.banner.frames_until_next -= 1;
+            return;
+        }
 
-        let _total_text_w = text.len() * (char_w + spacing) * scale;
-        // Start 2 screen-widths to the right so there's a quiet lead-in
-        let start_x = w as f32 * 2.5;
-        let start_y = (h as i32 - (char_h * scale) as i32) / 2;
+        // Spawn next character
+        let ci = self.banner.next_char;
+        if ci >= self.banner.text.len() {
+            self.banner.done = true;
+            return;
+        }
 
-        // Near-layer speed — scrolls through in ~12 seconds, feels close
+        let ch = self.banner.text[ci];
+        let glyph = BANNER_FONT.iter().find(|(c, _)| *c == ch);
+        let rows = match glyph {
+            Some((_, r)) => r,
+            None => {
+                // Space or unknown — just advance
+                self.banner.next_char += 1;
+                self.banner.frames_until_next = BANNER_FRAMES_PER_CHAR / 2; // spaces are quick
+                return;
+            }
+        };
+
+        let w = self.width;
+        let h = self.height;
+        // Place each letter at the right edge of screen, centered vertically
+        let start_x = (w + 20) as f32;
+        let start_y = (h as i32 - (BANNER_CHAR_H * BANNER_SCALE) as i32) / 2;
+
         let banner_speed = fp_from_float(-3.5);
-        let banner_color_bright = 0xFFFFEEDD; // warm white
-        let banner_color_dim = 0xFF8899BB;     // cool blue for variety
+        let banner_color_bright = 0xFFFFEEDD;
+        let banner_color_dim = 0xFF8899BB;
 
-        for (ci, &ch) in text.iter().enumerate() {
-            // Find glyph
-            let glyph = font.iter().find(|(c, _)| *c == ch);
-            let rows = match glyph {
-                Some((_, r)) => r,
-                None => continue,
-            };
+        for row in 0..BANNER_CHAR_H {
+            let bits = rows[row];
+            for col in 0..BANNER_CHAR_W {
+                if bits & (1 << (BANNER_CHAR_W - 1 - col)) == 0 { continue; }
 
-            let char_x = start_x + (ci * (char_w + spacing) * scale) as f32;
+                for _ in 0..BANNER_DENSITY {
+                    if self.count >= STAR_CEILING { break; }
+                    let idx = self.count;
 
-            for row in 0..char_h {
-                let bits = rows[row];
-                for col in 0..char_w {
-                    if bits & (1 << (char_w - 1 - col)) == 0 { continue; }
+                    let px = start_x + (col * BANNER_SCALE) as f32
+                        + (self.rng.range(BANNER_SCALE as u32) as f32);
+                    let py = start_y as f32 + (row * BANNER_SCALE) as f32
+                        + (self.rng.range(BANNER_SCALE as u32) as f32);
 
-                    // For each "on" pixel, spawn `star_density` stars
-                    // scattered within the scale×scale area
-                    for _ in 0..star_density {
-                        if self.count >= STAR_CEILING { return; }
-                        let idx = self.count;
+                    if py < 0.0 || py >= h as f32 { continue; }
 
-                        let px = char_x + (col * scale) as f32
-                            + (self.rng.range(scale as u32) as f32);
-                        let py = start_y as f32 + (row * scale) as f32
-                            + (self.rng.range(scale as u32) as f32);
+                    self.x[idx] = (px as i32) << FP_SHIFT;
+                    self.y[idx] = (py as i32) << FP_SHIFT;
 
-                        if py < 0.0 || py >= h as f32 { continue; }
+                    let vary = self.rng.range(2000) as i32 - 1000;
+                    self.speed_x[idx] = banner_speed + vary;
+                    self.speed_y[idx] = 0;
 
-                        self.x[idx] = (px as i32) << FP_SHIFT;
-                        // Wrap Y into screen
-                        self.y[idx] = ((py as i32).rem_euclid(h as i32)) << FP_SHIFT;
+                    let base = if self.rng.range(3) == 0 { banner_color_dim } else { banner_color_bright };
+                    let bright = 200 + self.rng.range(56) as u8;
+                    self.base_bright[idx] = bright;
+                    let c = dim_color(base, bright as u32);
+                    self.color[idx] = c;
+                    self.base_color[idx] = c;
+                    self.color_edge[idx] = 0;
+                    self.color_corner[idx] = 0;
+                    self.size[idx] = 0;
 
-                        // Slight speed variation so letters shimmer apart over time
-                        let vary = self.rng.range(3000) as i32 - 1500; // ±1500 in fp
-                        self.speed_x[idx] = banner_speed + vary;
-                        self.speed_y[idx] = 0;
-
-                        // Alternate warm/cool for a richer look
-                        let base = if self.rng.range(3) == 0 { banner_color_dim } else { banner_color_bright };
-                        let bright = 200 + self.rng.range(56) as u8;
-                        self.base_bright[idx] = bright;
-                        let c = dim_color(base, bright as u32);
-                        self.color[idx] = c;
-                        self.base_color[idx] = c;
-                        self.color_edge[idx] = 0;
-                        self.color_corner[idx] = 0;
-                        self.size[idx] = 0;
-
-                        self.count += 1;
-                    }
+                    self.count += 1;
                 }
             }
         }
 
-        // Re-sort to include banner stars in the size-0 group
+        // Re-sort so new stars are in the size-0 group
         self.sort_by_size();
-        // Start sparse — adaptive system will grow the field while banner scrolls
-        self.active = MIN_STARS + 3000; // just enough to see some background
+        self.active = self.count;
         self.recompute_active_groups();
+
+        self.banner.next_char += 1;
+        self.banner.frames_until_next = BANNER_FRAMES_PER_CHAR;
+    }
+
+    /// Recycle banner stars that scrolled off-screen into regular background stars.
+    fn recycle_banner_stars(&mut self) {
+        if self.banner_start >= self.count { return; }
+        let w = self.width;
+        let h = self.height;
+        let screen_w = w as i32;
+        for i in self.banner_start..self.count {
+            let px = self.x[i] >> FP_SHIFT;
+            // Stars move left. With wrapping, a star that goes past x=0
+            // wraps to x=max_x. Detect: if x > screen_w + some margin,
+            // it just wrapped from negative — recycle it.
+            if px > screen_w + 200 {
+                // Scatter to random position and become a regular background star
+                let l = self.rng.range(LAYER_COUNT as u32) as usize;
+                let ld = &LAYERS[l];
+                self.x[i] = (self.rng.range(w as u32) as i32) << FP_SHIFT;
+                self.y[i] = (self.rng.range(h as u32) as i32) << FP_SHIFT;
+                let spd_x = fp_from_float(ld.speed_x);
+                self.speed_x[i] = -(spd_x.max(1));
+                self.speed_y[i] = 0;
+                let bright = ld.bright_lo + self.rng.range((ld.bright_hi - ld.bright_lo + 1) as u32) as u8;
+                self.base_bright[i] = bright;
+                let c = dim_color(ld.color, bright as u32);
+                self.color[i] = c;
+                self.base_color[i] = c;
+            }
+        }
     }
 
     fn sort_by_size(&mut self) {
@@ -463,6 +524,10 @@ impl Starfield {
     }
 
     pub fn update(&mut self, dt: f32) {
+        // Banner: spawn letters one at a time, recycle when off-screen
+        self.tick_banner();
+        self.recycle_banner_stars();
+
         let count = self.active;
         let mx = self.max_x;
         let my = self.max_y;
