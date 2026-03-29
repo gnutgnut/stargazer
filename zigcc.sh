@@ -1,14 +1,15 @@
 #!/bin/sh
-# Wrapper: translate Rust's target triple to zig's format, or strip it
+ZIG="${HOME}/.local/bin/zig"
 args=""
 for arg in "$@"; do
     case "$arg" in
-        --target=x86_64-unknown-linux-gnu)
-            args="$args --target=x86_64-linux-gnu"
+        --target=*-unknown-linux-gnu)
+            triple="$(echo "$arg" | sed 's/--target=//;s/-unknown-linux-gnu/-linux-gnu/')"
+            args="$args --target=$triple"
             ;;
         *)
             args="$args $arg"
             ;;
     esac
 done
-exec /home/jay/.local/bin/zig cc $args
+exec "$ZIG" cc $args
