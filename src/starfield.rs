@@ -285,7 +285,7 @@ impl Starfield {
         let w = self.width;
         let h = self.height;
         // Use the far-layer color for extra stars (dim background dots)
-        let base_color = LAYERS[0].color;
+        let _base_color = LAYERS[0].color;
         let insert_at = self.count; // append at end (all size-0 are at the front)
 
         for j in 0..n {
@@ -299,7 +299,9 @@ impl Starfield {
             self.speed_y[idx] = 0;
             let bright = 30 + self.rng.range(70) as u8;
             self.base_bright[idx] = bright;
-            let c = dim_color(base_color, bright as u32);
+            // DEBUG: alternate red/green so new stars are visible
+            let debug_color = if j % 2 == 0 { 0xFFFF4444 } else { 0xFF44FF44 };
+            let c = dim_color(debug_color, bright as u32);
             self.color[idx] = c;
             self.base_color[idx] = c;
             self.color_edge[idx] = 0;
