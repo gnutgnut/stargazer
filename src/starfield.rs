@@ -169,7 +169,7 @@ impl Starfield {
 
                 let vary_range = (spd_x / 4).unsigned_abs().max(1);
                 let vary = sf.rng.range(vary_range) as i32;
-                sf.speed_x[idx] = (spd_x - spd_x / 8 + vary).max(1);
+                sf.speed_x[idx] = -((spd_x - spd_x / 8 + vary).max(1));
 
                 if spd_y > 0 {
                     let vy = sf.rng.range((spd_y as u32).wrapping_mul(2).max(1)) as i32;
@@ -207,7 +207,110 @@ impl Starfield {
         sf.sort_by_size();
         sf.active = sf.count;
         sf.recompute_active_groups();
+
+        // Spawn the intro banner — stars forming "STARGAZER" that scroll in
+        sf.spawn_banner(w, h);
+
         sf
+    }
+
+    /// Spawn stars that form the text "STARGAZER v0.1.0".
+    /// Stars are placed off-screen to the right at a mid-layer speed,
+    /// so they scroll in naturally, linger, and dissolve into the field.
+    fn spawn_banner(&mut self, w: usize, h: usize) {
+        // 7-wide x 9-tall bitmap font — each char is 9 bytes, 7 bits per row
+        #[rustfmt::skip]
+        let font: &[(u8, [u8; 9])] = &[
+            (b'S', [0b0111110, 0b1000001, 0b1000000, 0b0111100, 0b0000010, 0b0000001, 0b1000001, 0b0111110, 0b0000000]),
+            (b'T', [0b1111111, 0b0001000, 0b0001000, 0b0001000, 0b0001000, 0b0001000, 0b0001000, 0b0001000, 0b0000000]),
+            (b'A', [0b0011100, 0b0100010, 0b1000001, 0b1000001, 0b1111111, 0b1000001, 0b1000001, 0b1000001, 0b0000000]),
+            (b'R', [0b1111110, 0b1000001, 0b1000001, 0b1111110, 0b1001000, 0b1000100, 0b1000010, 0b1000001, 0b0000000]),
+            (b'G', [0b0111110, 0b1000001, 0b1000000, 0b1000000, 0b1001111, 0b1000001, 0b1000001, 0b0111110, 0b0000000]),
+            (b'Z', [0b1111111, 0b0000010, 0b0000100, 0b0001000, 0b0010000, 0b0100000, 0b1000000, 0b1111111, 0b0000000]),
+            (b'E', [0b1111111, 0b1000000, 0b1000000, 0b1111100, 0b1000000, 0b1000000, 0b1000000, 0b1111111, 0b0000000]),
+            (b'v', [0b0000000, 0b0000000, 0b1000001, 0b0100010, 0b0100010, 0b0010100, 0b0010100, 0b0001000, 0b0000000]),
+            (b'0', [0b0111110, 0b1000001, 0b1000011, 0b1000101, 0b1001001, 0b1010001, 0b1100001, 0b0111110, 0b0000000]),
+            (b'1', [0b0001000, 0b0011000, 0b0101000, 0b0001000, 0b0001000, 0b0001000, 0b0001000, 0b0111110, 0b0000000]),
+            (b'.', [0b0000000, 0b0000000, 0b0000000, 0b0000000, 0b0000000, 0b0000000, 0b0011000, 0b0011000, 0b0000000]),
+            (b' ', [0b0000000, 0b0000000, 0b0000000, 0b0000000, 0b0000000, 0b0000000, 0b0000000, 0b0000000, 0b0000000]),
+        ];
+
+        let text = b"STARGAZER v0.1.0";
+        let char_w = 7;     // font width
+        let char_h = 9;     // font height
+        let scale = 10;     // pixels per font pixel — big and bold
+        let spacing = 3;    // gap between chars in font pixels
+        let star_density = 3; // stars per "on" pixel (denser = brighter letters)
+
+        let _total_text_w = text.len() * (char_w + spacing) * scale;
+        // Start 2 screen-widths to the right so there's a quiet lead-in
+        let start_x = w as f32 * 2.5;
+        let start_y = (h as i32 - (char_h * scale) as i32) / 2;
+
+        // Near-layer speed — scrolls through in ~12 seconds, feels close
+        let banner_speed = fp_from_float(-3.5);
+        let banner_color_bright = 0xFFFFEEDD; // warm white
+        let banner_color_dim = 0xFF8899BB;     // cool blue for variety
+
+        for (ci, &ch) in text.iter().enumerate() {
+            // Find glyph
+            let glyph = font.iter().find(|(c, _)| *c == ch);
+            let rows = match glyph {
+                Some((_, r)) => r,
+                None => continue,
+            };
+
+            let char_x = start_x + (ci * (char_w + spacing) * scale) as f32;
+
+            for row in 0..char_h {
+                let bits = rows[row];
+                for col in 0..char_w {
+                    if bits & (1 << (char_w - 1 - col)) == 0 { continue; }
+
+                    // For each "on" pixel, spawn `star_density` stars
+                    // scattered within the scale×scale area
+                    for _ in 0..star_density {
+                        if self.count >= STAR_CEILING { return; }
+                        let idx = self.count;
+
+                        let px = char_x + (col * scale) as f32
+                            + (self.rng.range(scale as u32) as f32);
+                        let py = start_y as f32 + (row * scale) as f32
+                            + (self.rng.range(scale as u32) as f32);
+
+                        if py < 0.0 || py >= h as f32 { continue; }
+
+                        self.x[idx] = (px as i32) << FP_SHIFT;
+                        // Wrap Y into screen
+                        self.y[idx] = ((py as i32).rem_euclid(h as i32)) << FP_SHIFT;
+
+                        // Slight speed variation so letters shimmer apart over time
+                        let vary = self.rng.range(3000) as i32 - 1500; // ±1500 in fp
+                        self.speed_x[idx] = banner_speed + vary;
+                        self.speed_y[idx] = 0;
+
+                        // Alternate warm/cool for a richer look
+                        let base = if self.rng.range(3) == 0 { banner_color_dim } else { banner_color_bright };
+                        let bright = 200 + self.rng.range(56) as u8;
+                        self.base_bright[idx] = bright;
+                        let c = dim_color(base, bright as u32);
+                        self.color[idx] = c;
+                        self.base_color[idx] = c;
+                        self.color_edge[idx] = 0;
+                        self.color_corner[idx] = 0;
+                        self.size[idx] = 0;
+
+                        self.count += 1;
+                    }
+                }
+            }
+        }
+
+        // Re-sort to include banner stars in the size-0 group
+        self.sort_by_size();
+        // Start sparse — adaptive system will grow the field while banner scrolls
+        self.active = MIN_STARS + 3000; // just enough to see some background
+        self.recompute_active_groups();
     }
 
     fn sort_by_size(&mut self) {
@@ -320,7 +423,7 @@ impl Starfield {
             let spd_x = fp_from_float(ld.speed_x);
             let vary_range = (spd_x / 4).unsigned_abs().max(1);
             let vary = self.rng.range(vary_range) as i32;
-            self.speed_x[idx] = (spd_x - spd_x / 8 + vary).max(1);
+            self.speed_x[idx] = -((spd_x - spd_x / 8 + vary).max(1));
 
             let spd_y = fp_from_float(ld.drift_y);
             if spd_y > 0 {
