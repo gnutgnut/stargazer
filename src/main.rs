@@ -617,6 +617,8 @@ impl Hud {
 
 // ── Main ────────────────────────────────────────────────────────────────────
 fn main() {
+    let logging = std::env::args().any(|a| a == "--log");
+
     let mut window = Window::new(
         "Stargazer",
         WIDTH,
@@ -647,8 +649,13 @@ fn main() {
     let mut adjust_counter: u32 = 0;
     let mut work_ms_accum: f32 = 0.0;
     let mut frame_num: u64 = 0;
-    let mut log = File::create("stargazer.log").expect("Failed to create log file");
-    writeln!(log, "frame,time_ms,dt_ms,active,fps,drops,adjusted").unwrap();
+    let mut log: Option<File> = if logging {
+        let mut f = File::create("stargazer.log").expect("Failed to create log file");
+        writeln!(f, "frame,time_ms,dt_ms,active,fps,drops,adjusted").unwrap();
+        Some(f)
+    } else {
+        None
+    };
     let app_start = Instant::now();
 
     eprintln!(
@@ -712,20 +719,21 @@ fn main() {
             adjust_counter = 0;
         }
 
-        // Log every frame, capped at 60000 lines (~16 min at 60fps, ~5MB max)
         frame_num += 1;
-        if frame_num <= 60000 {
-            let _ = writeln!(log, "{},{:.2},{:.2},{},{},{},{}",
-                frame_num,
-                app_start.elapsed().as_secs_f32() * 1000.0,
-                raw_dt * 1000.0,
-                sf.active,
-                fps,
-                total_drops,
-                if adjusted { 1 } else { 0 },
-            );
-            if frame_num == 60000 {
-                let _ = writeln!(log, "# log capped at 60000 frames");
+        if let Some(ref mut f) = log {
+            if frame_num <= 60000 {
+                let _ = writeln!(f, "{},{:.2},{:.2},{},{},{},{}",
+                    frame_num,
+                    app_start.elapsed().as_secs_f32() * 1000.0,
+                    raw_dt * 1000.0,
+                    sf.active,
+                    fps,
+                    total_drops,
+                    if adjusted { 1 } else { 0 },
+                );
+                if frame_num == 60000 {
+                    let _ = writeln!(f, "# log capped at 60000 frames");
+                }
             }
         }
 
