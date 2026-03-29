@@ -1,4 +1,5 @@
 /target
+/target-win
 .cargo/
 .claude/
 stargazer.log

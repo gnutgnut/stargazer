@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Stargazer</title>
+<style>
+  * { margin: 0; padding: 0; }
+  body { background: #000; overflow: hidden; display: flex; justify-content: center; align-items: center; height: 100vh; }
+  canvas { image-rendering: pixelated; image-rendering: crisp-edges; max-width: 100vw; max-height: 100vh; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script type="module">
+import init, { StargazerWeb } from './pkg/stargazer.js';
+
+async function run() {
+    await init();
+    const sg = new StargazerWeb();
+    const canvas = document.getElementById('c');
+    canvas.width = sg.width();
+    canvas.height = sg.height();
+    const ctx = canvas.getContext('2d');
+
+    let lastTime = performance.now();
+
+    function frame(now) {
+        const dt = (now - lastTime) / 1000.0;
+        lastTime = now;
+        sg.frame(dt, now, ctx);
+        requestAnimationFrame(frame);
+    }
+
+    requestAnimationFrame(frame);
+}
+
+run();
+</script>
+</body>
+</html>

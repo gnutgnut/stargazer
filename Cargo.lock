@@ -589,6 +589,8 @@ name = "stargazer"
 version = "0.1.0"
 dependencies = [
  "minifb",
+ "wasm-bindgen",
+ "web-sys",
 ]
 
 [[package]]

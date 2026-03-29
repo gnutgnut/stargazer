@@ -3,8 +3,23 @@ name = "stargazer"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
+wasm-bindgen = { version = "0.2", optional = true }
+web-sys = { version = "0.3", optional = true, features = [
+    "CanvasRenderingContext2d",
+    "HtmlCanvasElement",
+    "ImageData",
+] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 minifb = "0.28"
+
+[features]
+default = []
+web = ["dep:wasm-bindgen", "dep:web-sys"]
 
 [profile.release]
 opt-level = 3
